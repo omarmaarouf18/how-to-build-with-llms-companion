@@ -33,8 +33,10 @@ TOOLS = [
 def allowed(name, args):
     if name == "read_file":
         path = (ROOT / args["path"]).resolve()
-        inside = path == ROOT or ROOT in path.parents
-        return inside and not any(s in str(path) for s in SECRETS)
+        if path != ROOT and ROOT not in path.parents:
+            return False
+        rel = str(path.relative_to(ROOT))   # check only the part inside
+        return not any(s in rel for s in SECRETS)
     answer = input(f"\nAllow {name} {args}? [y/N] ")
     return answer.strip().lower() == "y"
 

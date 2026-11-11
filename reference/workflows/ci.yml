@@ -1,0 +1,254 @@
+name: CI Gate
+
+on:
+  push:
+    branches: [ main, logic-exploitation ]
+  pull_request:
+    branches: [ main, logic-exploitation ]
+
+jobs:
+  lint-formatting:
+    name: Lint & Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+
+      - name: Verify Formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted properly:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Verify Markdown Commit SHAs
+        run: |
+          FAILED_SHA=0
+
+          for file in $(find . -type f -name "*.md" -not -path "*/node_modules/*" -not -path "*/vendor/*" -not -path "*/.git/*"); do
+            for sha in $(grep -oE "[0-9a-f]{40}" "$file" || true); do
+              if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+                echo "BLOCKED: fabricated/non-existent SHA $sha in $file"
+                FAILED_SHA=1
+              elif ! git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+                echo "BLOCKED: SHA $sha in $file is not reachable from current branch history"
+                FAILED_SHA=1
+              fi
+            done
+          done
+
+          if [ "$FAILED_SHA" -eq 1 ]; then
+            exit 1
+          fi
+
+      # Canonical version: GO_VERSION in tools/versions.env. The script also
+      # checks the go-version lines of this file against it.
+      - name: Verify Go Version Consistency (Drift Guard)
+        run: bash scripts/check-go-version.sh
+
+      # WF-03 parity: the local gate validates the touched compose stack(s)
+      # on infrastructure/** changes; CI validates all of them on every push.
+      # Placeholders only, no secrets (see the script header).
+      - name: Validate Compose Stacks
+        run: bash scripts/compose-validate.sh
+
+      # WF-RELEASE: single source script tests runner (matches pre-push gate)
+      - name: Run Script Regression Tests
+        run: bash scripts/run_script_tests.sh
+
+      - name: Backend-Frontend Parity Check (Informational)
+        run: make backend-frontend-parity-check
+        continue-on-error: true
+
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping: 1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - { path: services/api-gateway, name: api-gateway }
+          - { path: services/auth-service, name: auth-service }
+          - { path: services/chat-service, name: chat-service }
+          - { path: services/notification-service, name: notification-service }
+          - { path: services/user-service, name: user-service }
+          - { path: shared/infra, name: shared-infra }
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ${{ matrix.service.path }}/go.sum
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service.path }}
+        run: go mod download
+
+      - name: Build Service
+        working-directory: ${{ matrix.service.path }}
+        run: go build ./...
+
+      - name: Vet Service
+        working-directory: ${{ matrix.service.path }}
+        run: go vet ./...
+
+      - name: Test Service
+        working-directory: ${{ matrix.service.path }}
+        env:
+          MONGO_URI: mongodb://localhost:27017
+          REDIS_URI: redis://localhost:6379
+          MONGO_INITDB_DATABASE: saas_platform_test
+        run: go test ./... -count=1
+
+      # Same pinned versions and build recipe as the local gate
+      # (.githooks/pre-push): versions live only in tools/versions.env.
+      # scripts/install-tools.sh prints GOSEC_BIN=... / GOVULNCHECK_BIN=...
+      # lines, which become this step's outputs.
+      - name: Install pinned security tools
+        id: tools
+        run: bash scripts/install-tools.sh >> "$GITHUB_OUTPUT"
+
+      # Policy difference vs the local gate (documented in
+      # docs/CI_CD_AND_HOOKS.md, open question): CI fails on ANY finding,
+      # including stdlib ones; the local hook only warns on stdlib findings.
+      - name: Run govulncheck
+        working-directory: ${{ matrix.service.path }}
+        env:
+          GOVULNCHECK_BIN: ${{ steps.tools.outputs.GOVULNCHECK_BIN }}
+        run: '"$GOVULNCHECK_BIN" ./...'
+
+      - name: Run gosec
+        working-directory: ${{ matrix.service.path }}
+        env:
+          GOSEC_BIN: ${{ steps.tools.outputs.GOSEC_BIN }}
+        run: '"$GOSEC_BIN" ./...'
+
+  # WF-03: secret scan of the pushed range only (old history still holds
+  # long-removed staging credentials; see .gitleaks.toml). Same pinned
+  # gitleaks, config and script as the local gate; values are redacted.
+  secret-scan:
+    name: Secret Scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+
+      - name: Install pinned gitleaks
+        id: tools
+        run: bash scripts/install-tools.sh >> "$GITHUB_OUTPUT"
+
+      # push: github.event.before..github.sha (an all-zero or unknown
+      # "before", e.g. a new branch or a force-push, scans the head commit
+      # only). pull_request: base..head of the PR.
+      - name: Scan pushed range
+        env:
+          GITLEAKS_BIN: ${{ steps.tools.outputs.GITLEAKS_BIN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            bash scripts/gitleaks-scan.sh range "$PR_BASE" "$PR_HEAD"
+          else
+            bash scripts/gitleaks-scan.sh range "$PUSH_BEFORE" "$GITHUB_SHA"
+          fi
+
+  # WF-03 parity: the local gate has always run tests/contracts; CI did not.
+  contracts-test:
+    name: API Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+
+      - name: Run tests/contracts
+        working-directory: tests/contracts
+        run: go test -v -count=1 ./...
+
+  flutter-test:
+    name: Flutter Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          # PINNED: pixel goldens (frontend/test/ui/goldens/ and
+          # frontend/test/features/**/goldens/) are only valid for
+          # the engine build that rendered them. Bumping this version requires
+          # regenerating goldens in the same change — see
+          # .github/workflows/regen-goldens.yml and frontend/README.md.
+          flutter-version: '3.44.6'
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: flutter pub get
+
+      - name: Verify Formatting
+        working-directory: frontend
+        run: dart format --set-exit-if-changed lib/
+
+      - name: Frontend Composition Gate
+        run: bash scripts/frontend_composition_gate.sh
+
+      - name: Flutter Analyze
+        working-directory: frontend
+        run: flutter analyze
+
+      - name: Flutter Test
+        working-directory: frontend
+        run: flutter test
+

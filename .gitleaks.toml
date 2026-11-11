@@ -1,0 +1,32 @@
+# .gitleaks.toml — secret-scan rules.
+#
+# Used by `make scan` / `make check` and by the secret-scan job in CI.
+# Adapted from the production repo, where gitleaks scans commit ranges and
+# uncommitted changes in the local gate and in CI (see reference/docs/CI_CD_AND_HOOKS.md).
+# Why test files are allowlisted for the generic rule: they contain fake,
+# key-shaped values on purpose (test JWT secrets, fake tokens).
+
+title = "companion gitleaks config"
+
+# Keep every default rule.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Placeholders that are never real secrets (CHANGE_ME_*, e.g. scripts/compose-validate.sh)"
+regexes = ['''CHANGE_ME[A-Za-z0-9_]*''']
+
+[[allowlists]]
+description = """Key-shaped literals in tests (test JWT secrets, fake tokens, passwords).
+Only the noisy generic rule is relaxed: specific rules (AWS, GitHub, Stripe,
+private keys, ...) still fire in test files."""
+targetRules = ["generic-api-key"]
+paths = [
+  '''_test\.go$''',
+  '''_test\.dart$''',
+  '''(^|/)testdata/''',
+]
+
+[[allowlists]]
+description = "Build output (ignored by git; only reachable through a dir scan)"
+paths = ['''(^|/)frontend/build/''']

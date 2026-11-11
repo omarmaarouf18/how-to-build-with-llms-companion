@@ -1,0 +1,569 @@
+// Package hub implements a Server-Sent Events (SSE) broadcasting hub
+// for real-time notification delivery to role-based session pools.
+package hub
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/project/notification-service/internal/fcm"
+	"github.com/project/notification-service/internal/templates"
+	"github.com/redis/go-redis/v9"
+)
+
+// Role represents the session pool a client belongs to.
+type Role string
+
+const (
+	RoleOwner    Role = "owner"
+	RoleEmployee Role = "employee"
+	RoleClient   Role = "client"
+)
+
+// Notification is the payload broadcast to connected clients.
+type Notification struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`              // "job_alert", "status_update", "system", "popup"
+	TenantID  string    `json:"tenant_id"`         // scope to tenant
+	UserID    string    `json:"user_id,omitempty"` // target user ID if single recipient
+	UserIDs   []string  `json:"user_ids,omitempty"`
+	JobID     string    `json:"job_id,omitempty"`
+	Global    bool      `json:"global"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	Roles     []Role    `json:"roles"`
+	Timestamp time.Time `json:"timestamp"`
+	// Params are the sender's named values for the push templates
+	// (PUSH-L10N: fare, reason, ticket_id, variant…). Title and Body stay
+	// the sender's English text.
+	Params map[string]string `json:"params,omitempty"`
+}
+
+// ToClient projects the broadcast to its client-safe shape (A6):
+// ClientNotification carries no routing metadata (other recipients,
+// role/global targeting). Routing itself is unaffected — Redis fan-out
+// and per-client filtering run on the full Notification before this
+// projection.
+func (n Notification) ToClient() ClientNotification {
+	return ClientNotification{
+		ID:        n.ID,
+		Type:      n.Type,
+		TenantID:  n.TenantID,
+		UserID:    n.UserID,
+		JobID:     n.JobID,
+		EventType: JobEventType(n.Type, n.JobID),
+		Title:     n.Title,
+		Body:      n.Body,
+		Timestamp: n.Timestamp,
+		Params:    n.Params,
+		Texts:     templates.RenderAll(n.Type, n.Params),
+	}
+}
+
+// JobEventType is the stable `event_type` of a notification: the same
+// value as `type` for every notification about one job (it carries a
+// job_id), "admin_announcement" for admin notifications, empty otherwise. Derived, never stored, so history written
+// before the field existed carries it too (BE-GAPS-FIX item 1).
+func JobEventType(notifType, jobID string) string {
+	if notifType == "admin_announcement" {
+		return "admin_announcement"
+	}
+	if jobID == "" {
+		return ""
+	}
+	return notifType
+}
+
+// ClientNotification is the wire shape delivered to SSE clients.
+type ClientNotification struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	TenantID  string    `json:"tenant_id"`
+	UserID    string    `json:"user_id,omitempty"`
+	JobID     string    `json:"job_id,omitempty"`
+	EventType string    `json:"event_type,omitempty"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	Timestamp time.Time `json:"timestamp"`
+	// Params and Texts (PUSH-L10N): the template parameters and the title
+	// and body in each app language ("ar", "en"), when the type has a
+	// template; Title and Body stay the sender's English text.
+	Params map[string]string         `json:"params,omitempty"`
+	Texts  map[string]templates.Text `json:"texts,omitempty"`
+}
+
+// SSEClient represents a single SSE connection.
+type SSEClient struct {
+	ID       string
+	UserID   string
+	TenantID string
+	Role     Role
+	Send     chan []byte
+}
+
+// DeviceTokenFetcher defines interface for cross-service token lookup and stale token unregistration.
+type DeviceTokenFetcher interface {
+	GetUserDeviceTokens(ctx context.Context, userID string) ([]string, error)
+	UnregisterStaleToken(ctx context.Context, userID, token string) error
+}
+
+// PushTarget is one device token and the app language it registered with
+// ("ar" | "en"; empty for apps that send none, PUSH-L10N).
+type PushTarget struct {
+	Token  string
+	Locale string
+}
+
+// PushTargetFetcher is a DeviceTokenFetcher that also knows each token's
+// locale. The hub uses it when the fetcher offers it; a plain
+// DeviceTokenFetcher keeps today's behaviour (no locale, English text).
+type PushTargetFetcher interface {
+	GetUserPushTargets(ctx context.Context, userID string) ([]PushTarget, error)
+}
+
+type hubPubSubPayload struct {
+	OriginInstanceID string        `json:"origin_instance_id"`
+	Notification     *Notification `json:"notification"`
+}
+
+// SSEHub manages SSE client pools organized by role and tenant.
+type SSEHub struct {
+	mu                 sync.RWMutex
+	clients            map[*SSEClient]bool
+	instanceID         string // unique instance ID to prevent duplicate self-delivery from Redis
+	rdb                *redis.Client
+	pubsub             *redis.PubSub
+	cancel             context.CancelFunc
+	stopOnce           sync.Once
+	readyCh            chan struct{}
+	readyOnce          sync.Once
+	readyErr           error
+	fcmDispatcher      fcm.Dispatcher
+	deviceTokenFetcher DeviceTokenFetcher
+}
+
+// NewSSEHub creates a new hub.
+func NewSSEHub() *SSEHub {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		bytes = []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	}
+	instID := hex.EncodeToString(bytes)
+
+	return &SSEHub{
+		clients:    make(map[*SSEClient]bool),
+		instanceID: instID,
+		readyCh:    make(chan struct{}),
+	}
+}
+
+// markReady marks the Redis subscription as active (closing readyCh).
+func (h *SSEHub) markReady() {
+	h.readyOnce.Do(func() {
+		close(h.readyCh)
+	})
+}
+
+// WaitForReady waits until the Redis Pub/Sub subscription is confirmed active
+// or returns immediately if Redis is not configured.
+func (h *SSEHub) WaitForReady(ctx context.Context) error {
+	h.mu.RLock()
+	rdb := h.rdb
+	readyCh := h.readyCh
+	h.mu.RUnlock()
+
+	if rdb == nil {
+		return nil
+	}
+
+	select {
+	case <-readyCh:
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		return h.readyErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SetRedisClient configures Redis Pub/Sub cross-instance fan-out.
+func (h *SSEHub) SetRedisClient(rdb *redis.Client) {
+	if rdb == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.cancel != nil {
+		h.cancel()
+	}
+	if h.pubsub != nil {
+		_ = h.pubsub.Close()
+	}
+
+	h.rdb = rdb
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	h.pubsub = rdb.PSubscribe(ctx, "notify:*", "account:events")
+	pubsub := h.pubsub
+	instID := h.instanceID
+	h.mu.Unlock()
+
+	// Confirm subscription is active with Redis before marking ready or starting consumer loop
+	subCtx, subCancel := context.WithTimeout(ctx, 3*time.Second)
+	_, err := pubsub.Receive(subCtx)
+	subCancel()
+	if err != nil {
+		log.Printf("[REDIS-PUBSUB-WARNING] Failed to confirm Redis subscription: %v — proceeding in degraded local mode", err)
+		h.mu.Lock()
+		h.readyErr = err
+		h.mu.Unlock()
+	} else {
+		log.Printf("[SSE-HUB] Connected to Redis Pub/Sub for cross-replica notification fan-out (Instance ID: %s)", instID)
+	}
+	h.markReady()
+
+	go h.redisSubscriberLoop(ctx, pubsub)
+}
+
+// DisconnectUser closes and removes all active SSE connections belonging to userID (F-03).
+func (h *SSEHub) DisconnectUser(userID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for client := range h.clients {
+		if client.UserID == userID || client.ID == userID {
+			delete(h.clients, client)
+			close(client.Send)
+			log.Printf("[SSE-HUB] Force disconnected suspended user: %s", userID)
+		}
+	}
+}
+
+// Close gracefully stops the Redis Pub/Sub subscriber loop and closes all connected SSE client channels.
+func (h *SSEHub) Close() {
+	h.stopOnce.Do(func() {
+		h.markReady()
+		h.mu.Lock()
+		cancel := h.cancel
+		pubsub := h.pubsub
+
+		for client := range h.clients {
+			close(client.Send)
+			delete(h.clients, client)
+		}
+		h.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		if pubsub != nil {
+			_ = pubsub.Close()
+		}
+	})
+}
+
+func (h *SSEHub) redisSubscriberLoop(ctx context.Context, pubsub *redis.PubSub) {
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			if msg.Channel == "account:events" {
+				var event struct {
+					Action string `json:"action"`
+					UserID string `json:"user_id"`
+				}
+				if err := json.Unmarshal([]byte(msg.Payload), &event); err == nil {
+					if event.Action == "ACCOUNT_SUSPENDED" && event.UserID != "" {
+						h.DisconnectUser(event.UserID)
+					}
+				}
+				continue
+			}
+
+			// De-duplication: check for envelope with OriginInstanceID
+			var payload hubPubSubPayload
+			if err := json.Unmarshal([]byte(msg.Payload), &payload); err == nil && payload.Notification != nil {
+				// De-duplication: if notification originated on this instance, skip local delivery
+				// because it was already delivered locally in-process on origin broadcast.
+				if payload.OriginInstanceID == h.instanceID {
+					continue
+				}
+				h.deliverLocal(*payload.Notification)
+				continue
+			}
+
+			// Fallback: un-enveloped raw Notification payloads (legacy / direct Redis publishers)
+			var n Notification
+			if err := json.Unmarshal([]byte(msg.Payload), &n); err != nil {
+				log.Printf("[SSE-HUB] Failed to unmarshal Redis notification payload: %v", err)
+				continue
+			}
+			h.deliverLocal(n)
+		}
+	}
+}
+
+// Register adds a client to the hub.
+func (h *SSEHub) Register(c *SSEClient) {
+	h.mu.Lock()
+	h.clients[c] = true
+	h.mu.Unlock()
+	log.Printf("[SSE-HUB] Client registered: id=%s tenant=%s role=%s (total: %d)",
+		c.ID, c.TenantID, c.Role, h.ClientCount())
+}
+
+// Unregister removes a client from the hub.
+func (h *SSEHub) Unregister(c *SSEClient) {
+	h.mu.Lock()
+	if _, ok := h.clients[c]; ok {
+		delete(h.clients, c)
+		close(c.Send)
+	}
+	h.mu.Unlock()
+	log.Printf("[SSE-HUB] Client unregistered: id=%s (total: %d)", c.ID, h.ClientCount())
+}
+
+// BroadcastGlobal sends a notification platform-wide to all clients regardless of tenant.
+func (h *SSEHub) BroadcastGlobal(n Notification) {
+	n.Global = true
+	h.Broadcast(n)
+}
+
+// Broadcast sends a notification to all matching clients based on tenant and role filters.
+func (h *SSEHub) Broadcast(n Notification) {
+	if n.Timestamp.IsZero() {
+		n.Timestamp = time.Now().UTC()
+	}
+	if n.ID == "" {
+		bytes := make([]byte, 16)
+		if _, err := rand.Read(bytes); err == nil {
+			n.ID = fmt.Sprintf("notif-%s", hex.EncodeToString(bytes))
+		} else {
+			n.ID = fmt.Sprintf("notif-%d", time.Now().UnixNano())
+		}
+	}
+
+	// 1. Immediate local delivery on publishing instance (in-process)
+	h.deliverLocal(n)
+
+	// 2. Publish to Redis for remote replica fan-out tagged with origin instance ID for dedup
+	h.mu.RLock()
+	rdb := h.rdb
+	instID := h.instanceID
+	h.mu.RUnlock()
+
+	if rdb != nil {
+		channel := "notify:global"
+		if !n.Global {
+			channel = fmt.Sprintf("notify:tenant:%s", n.TenantID)
+		}
+
+		payload := hubPubSubPayload{
+			OriginInstanceID: instID,
+			Notification:     &n,
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[SSE-HUB] Failed to marshal PubSub notification payload: %v", err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		if err := rdb.Publish(ctx, channel, data).Err(); err != nil {
+			log.Printf("[REDIS-PUBSUB-WARNING] Failed to publish notification to Redis channel %s: %v", channel, err)
+		}
+	}
+
+	// Parallel non-blocking FCM push delivery
+	go h.dispatchPush(n)
+}
+
+// SetPushDispatcher configures parallel FCM push notification delivery.
+func (h *SSEHub) SetPushDispatcher(dispatcher fcm.Dispatcher, fetcher DeviceTokenFetcher) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.fcmDispatcher = dispatcher
+	h.deviceTokenFetcher = fetcher
+}
+
+func (h *SSEHub) dispatchPush(n Notification) {
+	h.mu.RLock()
+	fcmDisp := h.fcmDispatcher
+	fetcher := h.deviceTokenFetcher
+	h.mu.RUnlock()
+
+	if fcmDisp == nil || !fcmDisp.IsEnabled() || fetcher == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[FCM-PUSH] Recovered from panic in push dispatch: %v", r)
+		}
+	}()
+
+	var targetUserIDs []string
+	if n.UserID != "" {
+		targetUserIDs = append(targetUserIDs, n.UserID)
+	}
+	for _, uid := range n.UserIDs {
+		if uid != "" && uid != n.UserID {
+			targetUserIDs = append(targetUserIDs, uid)
+		}
+	}
+
+	if len(targetUserIDs) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dataMap := map[string]string{
+		"id":        n.ID,
+		"type":      n.Type,
+		"tenant_id": n.TenantID,
+	}
+	if n.JobID != "" {
+		dataMap["job_id"] = n.JobID
+		dataMap["event_type"] = JobEventType(n.Type, n.JobID)
+	}
+	if n.Type == "admin_announcement" {
+		dataMap["event_type"] = "admin_announcement"
+		if dl := n.Params["deep_link"]; dl != "" {
+			dataMap["deep_link"] = dl
+		}
+	}
+
+	for _, userID := range targetUserIDs {
+		targets, err := userPushTargets(ctx, fetcher, userID)
+		if err != nil {
+			log.Printf("[FCM-PUSH] Failed to fetch device tokens for user %s: %v", userID, err)
+			continue
+		}
+
+		if len(targets) == 0 {
+			log.Printf("[FCM-PUSH] Debug: user %s has no registered device tokens (silent no-op)", userID)
+			continue
+		}
+
+		for _, target := range targets {
+			title, body := pushText(n, target.Locale)
+			isStale, err := fcmDisp.SendPush(ctx, target.Token, title, body, dataMap)
+			if isStale {
+				log.Printf("[FCM-PUSH] Cleaning up stale token for user %s", userID)
+				_ = fetcher.UnregisterStaleToken(ctx, userID, target.Token)
+			} else if err != nil {
+				log.Printf("[FCM-PUSH] Push to user %s failed: %v", userID, err)
+			}
+		}
+	}
+}
+
+// pushText is the title and body pushed to a device with locale: the
+// template for n's type in that language (PUSH-L10N), else the sender's text
+// (legacy devices without a locale, types without a template).
+func pushText(n Notification, locale string) (string, string) {
+	if t, ok := templates.Render(n.Type, locale, n.Params); ok {
+		return t.Title, t.Body
+	}
+	return n.Title, n.Body
+}
+
+// userPushTargets fetches userID's tokens, with their locales when the
+// fetcher knows them (PushTargetFetcher).
+func userPushTargets(ctx context.Context, fetcher DeviceTokenFetcher, userID string) ([]PushTarget, error) {
+	if pf, ok := fetcher.(PushTargetFetcher); ok {
+		return pf.GetUserPushTargets(ctx, userID)
+	}
+	tokens, err := fetcher.GetUserDeviceTokens(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]PushTarget, 0, len(tokens))
+	for _, t := range tokens {
+		targets = append(targets, PushTarget{Token: t})
+	}
+	return targets, nil
+}
+
+func (h *SSEHub) deliverLocal(n Notification) {
+	data, err := json.Marshal(n.ToClient())
+	if err != nil {
+		log.Printf("[SSE-HUB] Failed to marshal notification for local delivery: %v", err)
+		return
+	}
+
+	// Format as SSE event.
+	ssePayload := fmt.Appendf(nil, "event: notification\ndata: %s\n\n", data)
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	sent := 0
+	for client := range h.clients {
+		// Tenant scoping: unless explicitly marked global, only send to clients belonging to the target tenant.
+		if !n.Global && client.TenantID != n.TenantID {
+			continue
+		}
+		// Role filtering: if roles specified, only send to matching roles.
+		if len(n.Roles) > 0 && !containsRole(n.Roles, client.Role) {
+			continue
+		}
+		// User targeting (N-01): when a notification has a targeted recipient set (UserID or UserIDs),
+		// only deliver to that specific connected user.
+		if n.UserID != "" && client.UserID != n.UserID {
+			continue
+		}
+		if len(n.UserIDs) > 0 && !slices.Contains(n.UserIDs, client.UserID) {
+			continue
+		}
+		select {
+		case client.Send <- ssePayload:
+			sent++
+		default:
+			log.Printf("[SSE-HUB] Dropped notification for slow client %s", client.ID)
+		}
+	}
+	log.Printf("[SSE-HUB] Broadcast: type=%s tenant=%s → %d local clients", n.Type, n.TenantID, sent)
+}
+
+// ClientCount returns the number of connected clients.
+func (h *SSEHub) ClientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}
+
+// ClientsByRole returns a count per role.
+func (h *SSEHub) ClientsByRole() map[Role]int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	counts := map[Role]int{}
+	for c := range h.clients {
+		counts[c.Role]++
+	}
+	return counts
+}
+
+func containsRole(roles []Role, target Role) bool {
+	for _, r := range roles {
+		if r == target {
+			return true
+		}
+	}
+	return false
+}

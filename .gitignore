@@ -1,0 +1,17 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+infrastructure/certs/*.key
+infrastructure/certs/*.crt
+infrastructure/certs/*.srl
+
+# Agent worktrees (Claude Code creates them here)
+.claude/worktrees/
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Build output
+bin/
+*.test
+coverage.out

@@ -1,0 +1,65 @@
+# Local stack for the companion repo: MongoDB, Redis, and notification-service.
+# Trimmed from the production repo's dev compose (see reference/infrastructure/).
+# Run from the repo root:  make up
+name: companion
+
+services:
+  mongo:
+    image: mongo:7
+    # Production lesson: the default nofile limit (1024) crash-looped mongod
+    # under the test suites. 64000 is the image's documented recommendation.
+    ulimits:
+      nofile: { soft: 64000, hard: 64000 }
+    ports:
+      - "127.0.0.1:27017:27017"   # localhost only: see docs/lessons/07
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval \"db.adminCommand('ping')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  notification-service:
+    build:
+      context: ..                      # repo root: the build needs shared/infra
+      dockerfile: services/notification-service/Dockerfile
+      target: prod
+    ports:
+      - "127.0.0.1:${NOTIFICATION_SERVICE_PORT}:${NOTIFICATION_SERVICE_PORT}"
+    volumes:
+      - ./certs/ca.crt:/app/certs/ca.crt:ro
+      - ./certs/notification-service.crt:/app/certs/notification-service.crt:ro
+      - ./certs/notification-service.key:/app/certs/notification-service.key:ro
+    environment:
+      PORT: ${NOTIFICATION_SERVICE_PORT}
+      MONGO_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      NOTIFICATION_MONGO_DATABASE: ${MONGO_INITDB_DATABASE}
+      REDIS_URI: redis://:${REDIS_PASSWORD}@redis:6379/0
+      AUTH_SERVICE_URL: ${AUTH_SERVICE_URL}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN}
+      JWT_SECRET: ${JWT_SECRET}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      TLS_CERT_PATH: /app/certs/notification-service.crt
+      TLS_KEY_PATH: /app/certs/notification-service.key
+      TLS_CA_PATH: /app/certs/ca.crt
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID:-}
+      FCM_SERVICE_ACCOUNT_JSON_B64: ${FCM_SERVICE_ACCOUNT_JSON_B64:-}
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }

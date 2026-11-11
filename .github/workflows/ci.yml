@@ -1,0 +1,82 @@
+# CI for the companion repo. A trimmed version of the production pipeline
+# (reference/workflows/ci.yml): same build/vet/test recipe and services,
+# one service instead of five, plus a secret scan. Explained in docs/WHY.md.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same branch: saves CI minutes (Ch. 3.6, 4.1).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+      - name: gofmt must report nothing
+        run: test -z "$(gofmt -l services shared)" || { gofmt -l services shared; exit 1; }
+
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping: 1})'"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [services/notification-service, shared/infra]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        env:
+          MONGO_URI: mongodb://localhost:27017
+          REDIS_URI: redis://localhost:6379
+          REDIS_ADDR: localhost:6379
+          MONGO_INITDB_DATABASE: companion_test
+        run: go test ./... -count=1
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks (pinned, same version as production)
+        run: |
+          curl -sSL -o gl.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar xzf gl.tgz gitleaks
+      - name: Scan the tree
+        run: ./gitleaks dir . --config .gitleaks.toml --redact --no-banner

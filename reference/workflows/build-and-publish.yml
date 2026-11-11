@@ -1,0 +1,133 @@
+name: Build and Publish Docker Images
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    name: Build & Publish GHCR Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service:
+          - api-gateway
+          - auth-service
+          - chat-service
+          - notification-service
+          - user-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/saas-core-${{ matrix.service }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=raw,value=latest
+
+      - name: Build and push production Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./services/${{ matrix.service }}/Dockerfile
+          target: prod
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  update-deployment-repo:
+    name: Sync Deployment Repository (Full Structural Sync)
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Repository
+        uses: actions/checkout@v4
+        with:
+          path: saas-core
+
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: omarmaarouf18
+          repositories: saas-core-deploy
+
+      - name: Checkout Deployment Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/saas-core-deploy
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          path: saas-core-deploy
+
+      - name: Sync Full Structural Content from Reference Files
+        run: |
+          echo "=== Syncing docker-compose.prod.yml → docker-compose.yml ==="
+          cp saas-core/infrastructure/deploy/docker-compose.prod.yml saas-core-deploy/docker-compose.yml
+
+          echo "=== Substituting :IMAGE_TAG with commit SHA (colon-prefixed so the"
+          echo "=== KYC_CONSOLE_IMAGE_TAG env var name is NOT mangled) ==="
+          sed -i "s|:IMAGE_TAG|:${{ github.sha }}|g" saas-core-deploy/docker-compose.yml
+          grep -n "KYC_CONSOLE_IMAGE_TAG" saas-core-deploy/docker-compose.yml >/dev/null || {
+            echo "::error::KYC_CONSOLE_IMAGE_TAG placeholder lost during sync"; exit 1;
+          }
+
+          echo "=== Syncing Caddyfile ==="
+          cp saas-core/infrastructure/deploy/Caddyfile saas-core-deploy/Caddyfile
+
+          echo "=== Syncing deploy.yml workflow ==="
+          mkdir -p saas-core-deploy/.github/workflows
+          cp saas-core/infrastructure/deploy/deploy.yml saas-core-deploy/.github/workflows/deploy.yml
+
+          echo "=== Verifying docker-compose.yml syntax with dummy environment ==="
+          cd saas-core-deploy
+          grep -oE '\$\{?[A-Z0-9_]+\}?' docker-compose.yml | sed 's/[${}]//g' | sort -u | while read -r var; do
+            if [[ "$var" == *"PORT"* ]]; then
+              echo "${var}=8000"
+            else
+              echo "${var}=dummy_val_for_ci_validation"
+            fi
+          done > .env.ci.dummy
+
+          docker compose --env-file .env.ci.dummy config --quiet 2>/dev/null || {
+            echo "::error::Generated docker-compose.yml failed syntax validation!"
+            docker compose --env-file .env.ci.dummy config
+            rm -f .env.ci.dummy
+            exit 1
+          }
+          rm -f .env.ci.dummy
+          echo "docker-compose.yml syntax validated successfully."
+
+      - name: Commit and Push Changes
+        working-directory: saas-core-deploy
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "deploy: sync full structure and update image tags to commit ${{ github.sha }}"
+            git push origin main
+          fi

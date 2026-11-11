@@ -1,27 +1,17 @@
 # 12. A cheap model on a big job
 
-**Book chapters:** Ch. 3 (choosing models), Introduction (hallucination)
-**Area:** model selection
+**Book chapter:** Ch. 3.5, "A story from production: the fast model that planned a feature"
 
-<!--
-OMAR: this one needs your memory; it isn't recorded in the repository.
-Fill in the sections below in your own words (Arabic notes are fine; they'll be
-translated). Delete this comment when done.
--->
+This lesson is told in full in the book. In short: a cheap, fast "flash"-class model was given
+a feature to plan *and* implement, with short instructions. It drifted: it changed a lot of
+working code outside the feature and filled the gaps in the instructions with its own guesses.
+Finding and repairing the damage took a week.
 
-## What happened
-<!-- Which task? Which model, and why was it chosen (cost, speed, default)? -->
+What changed afterwards:
+- Planning goes to the strongest model, at high effort, and the plan is reviewed before any code.
+- Cheap models get narrow, fully specified tasks with a check they can't fake (tests).
+- Every task states its lane; anything outside it means stop and ask
+  (see [CLAUDE.md](../../CLAUDE.md)).
+- Work happens on a branch in small commits, so a wrong direction costs a revert, not a week.
 
-## What went wrong
-<!-- What did it hallucinate or get wrong? Fake APIs, invented files, false "done", broken logic? -->
-
-## How it was caught
-
-## What it cost
-<!-- Time, money, rework, anything that reached production? -->
-
-## What changed afterwards
-<!-- Which model/effort do you use for that kind of task now? Any rule added? -->
-
-## Takeaway
-<!-- One or two sentences. -->
+> A cheap model is only cheap when its mistakes are cheap to find.
